@@ -24,7 +24,7 @@ description: >
 python ~/.claude/skills/memex/memex.py --vault-path "<vault路径>" <子命令> [参数...]
 ```
 
-**Vault 路径**：`c:/Users/17552/iCloudDrive/iCloud~md~obsidian/记忆外载`
+**Vault 路径**：`f:/iCloud文件/iCloudDrive/iCloud~md~obsidian/记忆外载`
 
 ## 子命令
 

@@ -2,7 +2,7 @@
 """MemEx (外载记忆) — Core Engine for Obsidian Vault Chronicle Compilation.
 
 Handles: init, compile, backfill, search, register, catchup, status.
-v1.1 — entity subdirectories, expense tracking.
+v1.2 — no expense tracking.
 """
 
 import argparse
@@ -37,7 +37,6 @@ ENTITY_TYPES = ["人物", "事件", "地点"]  # entity subdirectories under 实
 MEMETYPE_DIR = "记忆体定义"
 CHRONICLE_SUFFIX = "年编年史"
 DIARY_BUFFER_DAYS = 7
-EXPENSE_RE = re.compile(r"今日消费[：:]\s*(\d+\.?\d*)\s*元?")
 SEPARATOR_RE = re.compile(r"^_{2,}\s*$")  # matches ___ separators
 
 
@@ -71,14 +70,6 @@ def get_year_from_chronicle_filename(filename: str) -> Optional[int]:
     if not m:
         return None
     return int(m.group(1))
-
-
-def parse_expense(text: str) -> Optional[float]:
-    """Extract expense amount from '今日消费：50 元' style lines."""
-    m = EXPENSE_RE.search(text)
-    if m and m.group(1):
-        return float(m.group(1))
-    return None
 
 
 def match_period(line: str) -> Optional[str]:
@@ -203,7 +194,6 @@ def generate_year_skeleton(year: int) -> str:
                         continue
                     weekday = WEEKDAY_NAMES[d.isoweekday() - 1]
                     lines.append(f"#### {d.strftime('%m-%d')} {weekday}")
-                    lines.append(f"- 今日消费： 元")
                     for period in PERIOD_ORDER:
                         lines.append(f"##### {period}")
                         lines.append(f"- {DEFAULT_ENTRY}")
@@ -251,9 +241,6 @@ def cmd_init(vault: VaultManager):
 - 上午 / 上午：
 - 下午 / 下午：
 - 晚上 / 晚间 / 晚间：
-
-## 消费记录
-- 每日首行：`今日消费：00 元`
 
 ## 归档规则
 - 每周一 00:00 自动编译上周日记 → 年文档
@@ -318,12 +305,10 @@ def parse_diary_content(content: str) -> dict:
 
     Returns dict with:
       - periods: {上午: [entries], 下午: [entries], 晚上: [entries]}
-      - expense: float or None
-      - manual: [lines without timestamps]
+      - manual: [lines outside any period]
     """
     periods: dict[str, list[str]] = {p: [] for p in PERIOD_ORDER}
     manual: list[str] = []
-    expense: Optional[float] = None
 
     current_period: Optional[str] = None
     lines = content.split("\n")
@@ -337,13 +322,6 @@ def parse_diary_content(content: str) -> dict:
         if SEPARATOR_RE.match(stripped):
             continue
 
-        # Check for expense line
-        if not expense:
-            exp = parse_expense(stripped)
-            if exp is not None:
-                expense = exp
-                continue
-
         # Check for period markers
         period = match_period(stripped)
         if period:
@@ -352,14 +330,11 @@ def parse_diary_content(content: str) -> dict:
 
         # If we're inside a period section
         if current_period and current_period in periods:
-            if re.match(r"\d{1,2}:\d{2}\s*[-—：:]\s*", stripped):
-                periods[current_period].append(stripped)
-            else:
-                manual.append(f"[{current_period}] {stripped}")
+            periods[current_period].append(stripped)
         else:
             manual.append(stripped)
 
-    return {"periods": periods, "expense": expense, "manual": manual}
+    return {"periods": periods, "manual": manual}
 
 
 # ── Compile ─────────────────────────────────────────────────────────
@@ -377,7 +352,6 @@ def compile_diary_to_chronicle(
     entities = vault.list_entities()
     parsed = parse_diary_content(content)
     periods = parsed["periods"]
-    expense = parsed["expense"]
 
     year = diary_date.year
     chronicle_path = vault.get_chronicle(year)
@@ -396,12 +370,6 @@ def compile_diary_to_chronicle(
 
     # Build the day entry
     entry_lines = [day_header]
-
-    # Expense line
-    if expense is not None:
-        entry_lines.append(f"- 今日消费：{expense:.0f} 元" if expense == int(expense) else f"- 今日消费：{expense:.2f} 元")
-    else:
-        entry_lines.append("- 今日消费： 元")
 
     for period in PERIOD_ORDER:
         entry_lines.append(f"##### {period}")
@@ -429,7 +397,7 @@ def compile_diary_to_chronicle(
         for line in day_content.split("\n"):
             stripped = line.strip()
             if stripped.startswith("-") and DEFAULT_ENTRY not in stripped and stripped != "-":
-                if "今日消费" not in stripped:  # expense line doesn't count
+                if "**" not in stripped:  # summary lines don't count
                     has_real_content = True
                     break
 
@@ -502,141 +470,6 @@ def compile_diary_to_chronicle(
     return diary_path
 
 
-# ── Expense Aggregation ────────────────────────────────────────────
-def _scan_chronicle_expenses(chronicle_content: str, year: int) -> dict:
-    """Scan chronicle for per-day expenses. Returns {date_str: amount}."""
-    expenses: dict[str, float] = {}
-    lines = chronicle_content.split("\n")
-    current_date_str = ""
-
-    for line in lines:
-        # Track day headers
-        day_match = re.match(r"^#### (\d{2}-\d{2})", line)
-        if day_match:
-            current_date_str = f"{year}-{day_match.group(1)}"
-            continue
-
-        # Check for expense line
-        if current_date_str and "今日消费" in line:
-            exp = parse_expense(line)
-            if exp is not None:
-                expenses[current_date_str] = exp
-
-    return expenses
-
-
-def _inject_summaries(vault: VaultManager, year: int):
-    """Calculate and inject week/month/year expense summaries into chronicle."""
-    chronicle_path = vault.get_chronicle(year)
-    if not chronicle_path.exists():
-        return
-    content = chronicle_path.read_text(encoding="utf-8")
-
-    # Scan for expenses
-    daily_expenses = _scan_chronicle_expenses(content, year)
-    if not daily_expenses:
-        return
-
-    # Remove old summary lines (to avoid duplication)
-    content = re.sub(r"\n- \*\*本周消费[：:].*\*\*\n", "\n", content)
-    content = re.sub(r"\n- \*\*本月消费[：:].*\*\*\n", "\n", content)
-    content = re.sub(r"\n- \*\*本年消费[：:].*\*\*\n", "\n", content)
-
-    modified = False
-
-    # --- Weekly summaries ---
-    for month in range(1, 13):
-        month_start = date(year, month, 1)
-        monday = month_start - timedelta(days=month_start.isoweekday() - 1)
-        month_end = date(year, month, days_in_month(year, month))
-
-        while monday <= month_end:
-            sunday = monday + timedelta(days=6)
-            week_label = get_week_label(monday)
-            week_header = f"### {week_label}"
-
-            week_pos = content.find(week_header)
-            if week_pos == -1:
-                monday += timedelta(days=7)
-                continue
-
-            # Sum expenses for this week's days
-            week_total = 0.0
-            for i in range(7):
-                d = monday + timedelta(days=i)
-                if d.month == month and d.year == year:
-                    key = d.strftime("%Y-%m-%d")
-                    if key in daily_expenses:
-                        week_total += daily_expenses[key]
-
-            if week_total > 0:
-                # Find the next section header after this week
-                after_week = content[week_pos + len(week_header):]
-                next_section = re.search(r"\n(?=##\s|\###\s)", after_week)
-                if next_section:
-                    insert_at = week_pos + len(week_header) + next_section.start()
-                else:
-                    insert_at = len(content)
-
-                summary_line = f"\n- **本周消费：{week_total:.0f} 元**\n"
-                if summary_line not in content:
-                    content = content[:insert_at] + summary_line + content[insert_at:]
-                    modified = True
-
-            monday += timedelta(days=7)
-
-    # --- Monthly summaries ---
-    for month in range(1, 13):
-        month_header = f"## {get_month_name(month)}"
-        month_pos = content.find(month_header)
-        if month_pos == -1:
-            continue
-
-        month_start = date(year, month, 1)
-        month_end = date(year, month, days_in_month(year, month))
-
-        month_total = 0.0
-        d = month_start
-        while d <= month_end:
-            key = d.strftime("%Y-%m-%d")
-            if key in daily_expenses:
-                month_total += daily_expenses[key]
-            d += timedelta(days=1)
-
-        if month_total > 0:
-            next_month_header = re.search(r"\n(?=##\s|\A\#\s)", content[month_pos + len(month_header):])
-            if next_month_header:
-                insert_at = month_pos + len(month_header) + next_month_header.start()
-            else:
-                insert_at = len(content)
-
-            summary_line = f"\n- **本月消费：{month_total:.0f} 元**\n"
-            if summary_line not in content:
-                content = content[:insert_at] + summary_line + content[insert_at:]
-                modified = True
-
-    # --- Yearly summary ---
-    year_total = sum(daily_expenses.values())
-    if year_total > 0:
-        year_header = f"# {year}年"
-        year_pos = content.find(year_header)
-        after_year = content[year_pos:]
-        next_h2 = re.search(r"\n(?=##\s)", after_year[len(year_header):])
-        if next_h2:
-            insert_at = year_pos + len(year_header) + next_h2.start()
-        else:
-            insert_at = len(content)
-
-        summary_line = f"\n- **本年累计消费：{year_total:.0f} 元**\n"
-        if summary_line not in content:
-            content = content[:insert_at] + summary_line + content[insert_at:]
-            modified = True
-
-    if modified:
-        chronicle_path.write_text(content, encoding="utf-8")
-        print(f"\n[汇总] 已更新 {year}年 消费统计")
-
-
 # ── Compile Command ────────────────────────────────────────────────
 def cmd_compile(vault: VaultManager, dry_run: bool = False):
     """Scan all unprocessed diaries and compile to chronicle."""
@@ -676,16 +509,6 @@ def cmd_compile(vault: VaultManager, dry_run: bool = False):
                 print(f"  [清理] 删除 {diary_path.name}")
                 diary_path.unlink()
 
-    # Inject expense summaries
-    if not dry_run:
-        years_seen = set()
-        for diary_path in compiled:
-            d = parse_diary_filename(diary_path.name)
-            if d:
-                years_seen.add(d.year)
-        for y in years_seen:
-            _inject_summaries(vault, y)
-
     # Check for month/year transitions
     _check_review_triggers(vault, today)
 
@@ -696,8 +519,6 @@ def _check_review_triggers(vault: VaultManager, today: date):
     if yesterday.month != today.month:
         print(f"\n[审阅] 检测到跨月 ({get_month_name(yesterday.month)} -> {get_month_name(today.month)})")
         print(f"  建议运行月审阅：回顾 {yesterday.year}年{get_month_name(yesterday.month)} 的内容")
-        # Update expense summaries for the past month
-        _inject_summaries(vault, yesterday.year)
 
     if yesterday.year != today.year:
         print(f"\n[审阅] 检测到跨年 ({yesterday.year} -> {today.year})")
@@ -734,9 +555,6 @@ def cmd_backfill(vault: VaultManager, target_date: date, period: str, content: s
     chronicle_content = chronicle_path.read_text(encoding="utf-8")
     entities = vault.list_entities()
     linked_content = entity_link(content, entities)
-
-    # Check for expense in content
-    expense = parse_expense(content)
 
     weekday = WEEKDAY_NAMES[target_date.isoweekday() - 1]
     day_header = f"#### {target_date.strftime('%m-%d')} {weekday}"
@@ -776,24 +594,6 @@ def cmd_backfill(vault: VaultManager, target_date: date, period: str, content: s
             chronicle_content = (
                 chronicle_content[:insert_after] + f"\n- {linked_content}" + chronicle_content[insert_after:]
             )
-
-        # Update expense if present
-        if expense is not None:
-            expense_line = f"- 今日消费：{expense:.0f} 元" if expense == int(expense) else f"- 今日消费：{expense:.2f} 元"
-            # Find existing expense line in this day section
-            day_end = chronicle_content.find("\n#### ", day_pos)
-            if day_end == -1:
-                day_end = chronicle_content.find("\n### ", day_pos)
-            if day_end == -1:
-                day_end = len(chronicle_content)
-            day_section = chronicle_content[day_pos:day_end]
-            if "今日消费" in day_section:
-                # Replace existing expense line
-                old_exp = re.search(r"- 今日消费[：:].*", day_section)
-                if old_exp:
-                    abs_start = day_pos + old_exp.start()
-                    abs_end = day_pos + old_exp.end()
-                    chronicle_content = chronicle_content[:abs_start] + expense_line + chronicle_content[abs_end:]
     else:
         # Day section doesn't exist — create full day entry with all periods
         month_header = f"## {get_month_name(target_date.month)}"
@@ -816,8 +616,6 @@ def cmd_backfill(vault: VaultManager, target_date: date, period: str, content: s
             insert_pos = len(chronicle_content)
 
         entry_lines = [day_header]
-        exp_str = f"- 今日消费：{expense:.0f} 元" if (expense is not None and expense == int(expense)) else f"- 今日消费：{expense:.2f} 元" if expense is not None else "- 今日消费： 元"
-        entry_lines.append(exp_str)
         entry_lines.append(f"##### {period}")
         entry_lines.append(f"- {linked_content}")
         for other_period in PERIOD_ORDER:
@@ -835,9 +633,6 @@ def cmd_backfill(vault: VaultManager, target_date: date, period: str, content: s
     for ent in entities:
         if ent["name"] in content:
             update_entity_backlinks(vault, ent["name"], ent["type"], target_date, content)
-
-    # Update expense summaries
-    _inject_summaries(vault, target_date.year)
 
     print(f"[OK] 补录 {target_date} {period}: {content}")
 
@@ -996,19 +791,6 @@ def cmd_status(vault: VaultManager):
         print(f"  [{etype}] {', '.join(names)}")
 
 
-# ── Summarize (force expense recalculation) ─────────────────────────
-def cmd_summarize(vault: VaultManager, year: Optional[int] = None):
-    """Force recalculate and inject expense summaries."""
-    if year is None:
-        year = date.today().year
-    chronicle_path = vault.get_chronicle(year)
-    if not chronicle_path.exists():
-        print(f"[ERROR] 编年史文件不存在: {chronicle_path.name}")
-        sys.exit(1)
-    _inject_summaries(vault, year)
-    print(f"[OK] {year}年 消费汇总已更新")
-
-
 # ── CLI ─────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="MemEx — 外载记忆引擎")
@@ -1040,9 +822,6 @@ def main():
     sub.add_parser("catchup", help="手动补编译（Cron 错过时使用）")
     sub.add_parser("status", help="显示当前状态")
 
-    p_summarize = sub.add_parser("summarize", help="强制重算消费汇总")
-    p_summarize.add_argument("--year", type=int, help="年份（默认当前年）")
-
     args = parser.parse_args()
 
     if not args.command:
@@ -1066,8 +845,6 @@ def main():
         cmd_catchup(vault)
     elif args.command == "status":
         cmd_status(vault)
-    elif args.command == "summarize":
-        cmd_summarize(vault, getattr(args, 'year', None))
 
 
 if __name__ == "__main__":
